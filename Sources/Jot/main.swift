@@ -331,7 +331,119 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             var title = recipe.map { "已收录到「\($0.displayName)」" } ?? "已收录到今日日记"
             var toastSource: SourceInfo? = SourceInfo(ctx)
             var detail = ctx.kind == .browser ? ctx.pageTitle : nil
+            var pageURL: URL?
             let prefs = Prefs.shared
+            /// Writes the entry and shows the toast — shared by the sync and async paths above.
+            func save() {
+                if let recipe { title = "已收录到「\(recipe.displayName)」" }
+                let finish = { [weak self] (ocr: [String: String]) in
+                    let w = DailyNoteWriter(vault: vault, attachmentOverride: prefs.attachmentFolder)
+                    defer { for d in result.tempDirs { try? FileManager.default.removeItem(at: d) } }
+                    History.skipped = []
+                    /// Everything after a successful write: skipped files, sound, page snapshot, toast.
+                    func delivered(note: URL) {
+                        let skipped = History.skipped
+                        if !skipped.isEmpty, skipped.count == result.files.count,
+                           result.markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            try? History.undoLast()          // nothing usable was saved: don't leave an empty entry
+                            Toast.show("这个文件读不到，没有收录", detail: Self.protectedHint, style: .warning, duration: 6)
+                            return
+                        }
+                        prefs.didFirstCapture = true
+                        if prefs.openAfterSave { CaptureModel.open(note: note, vault: vault) }
+                        SaveSound.play(prefs.saveSound)
+                        NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .now)
+                        // 打开: Obsidian vault → Obsidian; plain folder → the default Markdown app. Hidden when it already opened.
+                        let open: [Toast.Action] = prefs.openAfterSave ? [] : [
+                            .init(title: "打开") { CaptureModel.open(note: note, vault: vault) },
+                        ]
+                        if !skipped.isEmpty {
+                            Toast.show("已收录，但有 \(skipped.count) 个文件读不到", detail: Self.protectedHint, style: .warning,
+                                       actions: [.init(title: "撤销") { self?.undoLast() }] + open, duration: 6)
+                            return
+                        }
+                        // A page link saved bare: its own description and a head snapshot tuck in on
+                        // arrival (PDFs have no description to parse; the renderer has no browser
+                        // login state, so login walls simply skip).
+                        if let page = pageURL, result.files.isEmpty, let entry = History.last {
+                            if prefs.pageDescription, page.pathExtension.lowercased() != "pdf" {
+                                LinkTitle.description(page, timeout: 3) { d in
+                                    guard let d, let current = History.last,
+                                          current.note == entry.note, current.entry.hasPrefix(entry.entry) else { return }
+                                    try? w.amend(current, text: "\n> " + d, attachments: [])
+                                }
+                            }
+                            if prefs.pageSnapshot {
+                                WebSnapshot.capture(page) { file in
+                                    guard let file else { return }
+                                    defer { try? FileManager.default.removeItem(at: file.deletingLastPathComponent()) }
+                                    guard let now = History.last, now.note == entry.note,
+                                          now.entry.hasPrefix(entry.entry) else { return }
+                                    if (try? w.amend(now, text: "", attachments: [file])) != nil {
+                                        Toast.show("已补上网页快照", style: .success)
+                                    }
+                                }
+                            }
+                        }
+                        Toast.show(title, detail: detail, source: toastSource, actions: [
+                            .init(title: "撤销") { self?.undoLast() },
+                            .init(title: "补充想法") { History.last.map { self?.show(amend: $0) } },
+                        ] + open, duration: 3.6)
+                    }
+                    do {
+                        let dest = recipe?.destination ?? .daily
+                        switch dest.kind {
+                        case .daily:
+                            func dailyAppend() throws -> URL {
+                                // Page entries read as outline sections: separate them from what came before.
+                                var content = result.markdown
+                                if pageURL != nil, result.files.isEmpty,
+                                   let existing = try? String(contentsOf: w.noteURL(for: Date()), encoding: .utf8),
+                                   !existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                    content = "---\n" + content
+                                }
+                                let note = try w.append(content: content, attachments: result.files, ocr: ocr,
+                                                        source: result.source, asTask: recipe?.asTask ?? false, heading: prefs.insertHeading)
+                                _ = prefs.dailyCount(1)
+                                return note
+                            }
+                            // This page is already saved somewhere in the vault: add to its section instead.
+                            if recipe == nil, ctx.kind == .browser, let url = ctx.url {
+                                let query = url.absoluteString
+                                    .replacingOccurrences(of: "'", with: "").replacingOccurrences(of: "\\", with: "")
+                                ContentSearch().run(query, in: vault) { hits in
+                                    do {
+                                        // Spotlight lags behind a note written seconds ago: today's note is always a candidate.
+                                        var paths = hits.map { $0.0.path }
+                                        paths.append(w.noteURL(for: Date()).standardizedFileURL.path)
+                                        if let target = MergeTarget.pick(paths: paths, url: url.absoluteString, in: vault) {
+                                            // Never file the link twice: thoughts, selections and files join its section.
+                                            let page = History.Entry(note: target.file, entry: target.entry, files: [], indent: "")
+                                            self?.supplementPage(page, text: g.text, files: result.files,
+                                                                 tempDirs: result.tempDirs, ocr: ocr, pageTitle: ctx.pageTitle, writer: w)
+                                        } else {
+                                            delivered(note: try dailyAppend())
+                                        }
+                                    } catch {
+                                        Toast.show("保存失败", detail: error.localizedDescription, style: .warning)
+                                    }
+                                }
+                            } else {
+                                delivered(note: try dailyAppend())
+                            }
+                        case .note:
+                            delivered(note: try w.append(content: result.markdown, attachments: result.files, ocr: ocr, source: result.source,
+                                                         asTask: recipe?.asTask ?? false, to: vault.appendingPathComponent(dest.path)))
+                        case .folder:
+                            delivered(note: try w.createNote(folder: dest.path, title: NoteNaming.autoTitle(from: result.markdown),
+                                                             content: result.markdown, attachments: result.files, ocr: ocr, source: result.source))
+                        }
+                    } catch {
+                        Toast.show("保存失败", detail: error.localizedDescription, style: .warning)
+                    }
+                }
+                if prefs.ocrImages { OCR.recognize(result.files, completion: finish) } else { finish([:]) }
+            }
             if g.isEmpty {
                 // Nothing selected: what was just copied or captured, newest first.
                 // 「空选时收录剪贴板」off: skip the clipboard; the newest screenshot and the page link still work.
@@ -355,13 +467,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                     title = MediaKind(shot.url) == .video ? "已收录刚才的录屏" : "已收录刚才的截图"
                     toastSource = nil
                     detail = shot.url.lastPathComponent
-                } else if ctx.kind == .browser, let link = CaptureFormatter.pageLink(ctx) {
-                    result = .init(markdown: link, files: [], tempDirs: [], source: nil)
+                } else if ctx.kind == .browser, let link = CaptureFormatter.pageLink(ctx), let url = ctx.url,
+                          url.scheme?.lowercased() == "https" || url.scheme?.lowercased() == "http" {
+                    // Save right away as an outline heading; the description and snapshot tuck in afterwards (see delivered).
+                    pageURL = url
+                    result = .init(markdown: "# " + link, files: [], tempDirs: [], source: nil)
                     title = "已收录当前网页"
                 } else if prefs.clipboardFallback, let clip = watcher.clip() {
                     useClip(clip)
                 } else {
-                    Toast.show(prefs.clipboardFallback ? "没有选中内容，剪贴板也是空的" : "没有选中内容", detail: ctx.appName, style: .warning, actions: [
+                    Toast.show(prefs.clipboardFallback ? "没有选中内容，剪贴板也是空的" : "没有选中内容",
+                               detail: ctx.kind == .browser ? "当前浏览器页面没有内容" : "前台是 \(ctx.appName)", style: .warning, actions: [
                         .init(title: "打开输入框") { [weak self] in self?.show() },
                     ])
                     return
@@ -369,55 +485,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             } else {
                 result = CaptureFormatter.compose(g, ctx)
             }
-            if let recipe { title = "已收录到「\(recipe.displayName)」" }
-            let finish = { [weak self] (ocr: [String: String]) in
-                let w = DailyNoteWriter(vault: vault, attachmentOverride: prefs.attachmentFolder)
-                defer { for d in result.tempDirs { try? FileManager.default.removeItem(at: d) } }
-                History.skipped = []
-                do {
-                    let dest = recipe?.destination ?? .daily
-                    let note: URL
-                    switch dest.kind {
-                    case .daily:
-                        note = try w.append(content: result.markdown, attachments: result.files, ocr: ocr,
-                                            source: result.source, asTask: recipe?.asTask ?? false, heading: prefs.insertHeading)
-                        _ = prefs.dailyCount(1)
-                    case .note:
-                        note = try w.append(content: result.markdown, attachments: result.files, ocr: ocr, source: result.source,
-                                            asTask: recipe?.asTask ?? false, to: vault.appendingPathComponent(dest.path))
-                    case .folder:
-                        note = try w.createNote(folder: dest.path, title: NoteNaming.autoTitle(from: result.markdown),
-                                                content: result.markdown, attachments: result.files, ocr: ocr, source: result.source)
-                    }
-                    let skipped = History.skipped
-                    if !skipped.isEmpty, skipped.count == result.files.count,
-                       result.markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        try? History.undoLast()          // nothing usable was saved: don't leave an empty entry
-                        Toast.show("这个文件读不到，没有收录", detail: Self.protectedHint, style: .warning, duration: 6)
-                        return
-                    }
-                    prefs.didFirstCapture = true
-                    if prefs.openAfterSave { CaptureModel.open(note: note, vault: vault) }
-                    SaveSound.play(prefs.saveSound)
-                    NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .now)
-                    // 打开: Obsidian vault → Obsidian; plain folder → the default Markdown app. Hidden when it already opened.
-                    let open: [Toast.Action] = prefs.openAfterSave ? [] : [
-                        .init(title: "打开") { CaptureModel.open(note: note, vault: vault) },
-                    ]
-                    if !skipped.isEmpty {
-                        Toast.show("已收录，但有 \(skipped.count) 个文件读不到", detail: Self.protectedHint, style: .warning,
-                                   actions: [.init(title: "撤销") { self?.undoLast() }] + open, duration: 6)
-                        return
-                    }
-                    Toast.show(title, detail: detail, source: toastSource, actions: [
-                        .init(title: "撤销") { self?.undoLast() },
-                        .init(title: "补充想法") { History.last.map { self?.show(amend: $0) } },
-                    ] + open, duration: 3.6)
-                } catch {
-                    Toast.show("保存失败", detail: error.localizedDescription, style: .warning)
-                }
-            }
-            if prefs.ocrImages { OCR.recognize(result.files, completion: finish) } else { finish([:]) }
+            save()
         }
     }
 
@@ -496,6 +564,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             NSWorkspace.shared.open(URL(fileURLWithPath: path)); return
         }
         CaptureModel.open(note: URL(fileURLWithPath: path), vault: vault)
+    }
+
+    /// The page is already recorded somewhere in the vault: never file its link twice — a
+    /// thought, a selection or files all land at the end of that page's section.
+    private func supplementPage(_ page: History.Entry, text: String, files: [URL], tempDirs: [URL],
+                                ocr: [String: String], pageTitle: String?, writer w: DailyNoteWriter) {
+        let anchor = MergeTarget.sectionEnd(page)
+        if text.isEmpty, files.isEmpty {
+            Toast.show("这个网页已经存过", detail: pageTitle ?? "", style: .success, actions: [
+                .init(title: "补充想法") { [weak self] in self?.show(amend: anchor) },
+            ], duration: 4)
+            return
+        }
+        defer { for d in tempDirs { try? FileManager.default.removeItem(at: d) } }
+        do {
+            // A selection keeps its full text: a short heading for the outline, a quote below.
+            var added: [String] = []
+            if let heading = CaptureFormatter.sectionHeading(from: text) { added.append(heading) }
+            if text.count > 40 { added.append(CaptureFormatter.quote(text)) }
+            try w.amend(anchor, text: added.joined(separator: "\n"), attachments: files, ocr: ocr)
+            Toast.show("已补充到「\(pageTitle ?? "")」", detail: page.note.deletingPathExtension().lastPathComponent,
+                       style: .success, actions: [
+                .init(title: "补充想法") { [weak self] in History.last.map { self?.show(amend: $0) } },
+                .init(title: "撤销") { [weak self] in self?.undoLast() },
+            ], duration: 4)
+        } catch {
+            Toast.show("保存失败", detail: error.localizedDescription, style: .warning)
+        }
     }
 
     @objc func undoLast() {
@@ -906,6 +1002,35 @@ func selftest() -> Int32 {
     check("link title: og:title", LinkTitle.parse("<head><meta property=\"og:title\" content=\"置身事内 &amp; 读书\"><title>x</title>") ?? "", "置身事内 & 读书")
     check("link title: <title>", LinkTitle.parse("<title>\n  Hello &#x4E16;&#30028; \n</title>") ?? "", "Hello 世界")
 
+    // Page description (og:description first, <meta name=description> fallback), entities and truncation.
+    check("desc: og:description + entity", LinkTitle.parseDescription(#"<meta property="og:description" content="一篇讲 JEPA 的长文 &amp; 备注"><meta name="description" content="fallback">"#) ?? "",
+          "一篇讲 JEPA 的长文 & 备注")
+    check("desc: name=description fallback", LinkTitle.parseDescription(#"<meta content="后备" name="description">"#) ?? "", "后备")
+    let long = String(repeating: "长", count: 200)
+    check("desc: truncates to 160", String(LinkTitle.parseDescription("<meta property=\"og:description\" content=\"\(long)\">")?.count ?? 0), "161")
+    check("desc: missing", LinkTitle.parseDescription("<p>没写描述</p>") ?? "nil", "nil")
+
+    // Merge target: the latest modified candidate that really contains the URL.
+    let mv = FileManager.default.temporaryDirectory.appendingPathComponent("qob-merge-\(UUID().uuidString)", isDirectory: true)
+    try? FileManager.default.createDirectory(at: mv, withIntermediateDirectories: true)
+    let oldNote = mv.appendingPathComponent("旧.md"), newNote = mv.appendingPathComponent("新.md")
+    try? "看[链接](https://a.com/x) 的笔记".write(to: oldNote, atomically: true, encoding: .utf8)
+    try? "又提到了 https://a.com/x 第二次".write(to: newNote, atomically: true, encoding: .utf8)
+    try? FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -3600)], ofItemAtPath: oldNote.path)
+    check("merge: latest containing file wins", MergeTarget.pick(paths: ["旧.md", "新.md"], url: "https://a.com/x", in: mv)?.file.lastPathComponent ?? "", "新.md")
+    try? "没有这个网址".write(to: newNote, atomically: true, encoding: .utf8)
+    check("merge: files without the url are ignored", MergeTarget.pick(paths: ["旧.md", "新.md"], url: "https://a.com/x", in: mv)?.file.lastPathComponent ?? "", "旧.md")
+    check("merge: the matched line comes back for amend", MergeTarget.pick(paths: ["旧.md", "新.md"], url: "https://a.com/x", in: mv)?.entry ?? "", "看[链接](https://a.com/x) 的笔记")
+    check("merge: no candidates", String(MergeTarget.pick(paths: [], url: "https://a.com/x", in: mv) == nil), "true")
+    try? FileManager.default.removeItem(at: mv)
+
+    // Selected text of a recorded page becomes a capped one-line H2 under its entry.
+    check("heading: collapse + H2", CaptureFormatter.sectionHeading(from: "  a\n\nb  ") ?? "", "## a b")
+    check("heading: marks stripped", CaptureFormatter.sectionHeading(from: "### 标题 ##") ?? "", "## 标题")
+    check("heading: capped", String(CaptureFormatter.sectionHeading(from: String(repeating: "字", count: 200))?.count ?? 0), "44")
+    check("heading: whitespace only is nil", String(CaptureFormatter.sectionHeading(from: "   ") == nil), "true")
+    check("adblock: bundled host list ships with the app", String(WebSnapshot.adHosts.count > 3000), "true")
+
     print(failures == 0 ? "ALL PASS" : "\(failures) FAILED")
     return failures == 0 ? 0 : 1
 }
@@ -927,6 +1052,40 @@ if let i = CommandLine.arguments.firstIndex(of: "--search"), i + 2 < CommandLine
     }
     while !done && Date().timeIntervalSince(t1) < 10 { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
     exit(0)
+}
+
+/// `Jot --context`: print what SourceContext currently sees (debugging capture sources).
+if CommandLine.arguments.contains("--context") {
+    _ = NSApplication.shared
+    if let ctx = SourceContext.current() {
+        print("app:   \(ctx.appName) (\(ctx.bundleID))")
+        print("kind:  \(String(describing: ctx.kind))")
+        print("url:   \(ctx.url?.absoluteString ?? "nil")")
+        print("title: \(ctx.pageTitle ?? "nil")")
+        if let note = ctx.scriptNote { print("note:  \(note)") }
+    } else {
+        print("nil")
+    }
+    exit(0)
+}
+
+/// `Jot --websnapshot <url> <out.png>`: render a page offscreen and save its top viewport (CI smoke).
+if let i = CommandLine.arguments.firstIndex(of: "--websnapshot"), i + 2 < CommandLine.arguments.count {
+    _ = NSApplication.shared
+    let url = URL(string: CommandLine.arguments[i + 1])!
+    let out = URL(fileURLWithPath: CommandLine.arguments[i + 2])
+    print("snapshotting \(url) …")
+    WebSnapshot.capture(url) { file in
+        if let file {
+            try? FileManager.default.removeItem(at: out)
+            try? FileManager.default.copyItem(at: file, to: out)
+            print("saved \(out.path)")
+        } else {
+            print("snapshot failed")
+        }
+        exit(file == nil ? 1 : 0)
+    }
+    RunLoop.main.run()
 }
 
 if CommandLine.arguments.contains("--selftest") {

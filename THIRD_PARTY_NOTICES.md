@@ -22,3 +22,5 @@ Brand marks from Simple Icons (Google Chrome, Safari, Claude, Obsidian, WeChat, 
 The WeChat official-account and reward QR codes in `Resources/About/` belong to 向阳乔木 and are not covered by the MIT license; please don't reuse them in forks.
 
 `Resources/About/` 中的公众号与打赏二维码属于向阳乔木，不在 MIT 许可范围内，fork 时请替换或移除。
+
+- Peter Lowe Ad Servers list (Resources/AdBlock/ad-domains.txt) — bundled ad-server blocklist for the snapshot renderer. Source: https://pgl.yoyo.org/as/

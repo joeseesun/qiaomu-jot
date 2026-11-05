@@ -221,7 +221,36 @@ final class ContentSearch {
         let before = line[..<lr.lowerBound], after = line[lr.upperBound...]
         let head = before.count > 18 ? "…" + before.suffix(18) : String(before)
         let tail = after.count > 40 ? after.prefix(40) + "…" : String(after)
-        return head + line[lr] + tail
+        return head + String(line[lr.lowerBound..<lr.upperBound]) + tail
+    }
+}
+
+/// For 「同网址归并到已存笔记」: the most recently modified candidate that really contains the
+/// URL, with the exact line it sits on so follow-ups can be amended right under it.
+enum MergeTarget {
+    static func pick(paths: [String], url: String, in vault: URL) -> (file: URL, entry: String)? {
+        var best: (file: URL, entry: String, modified: Date)?
+        let root = vault.standardizedFileURL.path
+        for p in paths.prefix(20) where p.hasSuffix(".md") {
+            let file = URL(fileURLWithPath: p.hasPrefix("/") ? p : root + "/" + p)
+            guard let text = try? String(contentsOf: file, encoding: .utf8),
+                  let line = text.components(separatedBy: "\n").first(where: { $0.contains(url) }) else { continue }
+            let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            if best == nil || modified > best!.modified { best = (file, line, modified) }
+        }
+        return best.map { (file: $0.file, entry: $0.entry) }
+    }
+
+    /// The page's whole section as one amend anchor: from its line down to the last line before
+    /// the next `#` heading or `---` rule — so additions land below everything the page owns.
+    static func sectionEnd(_ page: History.Entry) -> History.Entry {
+        guard let text = try? String(contentsOf: page.note, encoding: .utf8) else { return page }
+        let lines = text.components(separatedBy: "\n")
+        guard let i = lines.firstIndex(of: page.entry) else { return page }
+        var j = i
+        while j + 1 < lines.count,
+              lines[j + 1].range(of: #"^(?:#\s|---\s*$)"#, options: .regularExpression) == nil { j += 1 }
+        return History.Entry(note: page.note, entry: lines[i...j].joined(separator: "\n"), files: [], indent: "")
     }
 }
 

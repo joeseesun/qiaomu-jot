@@ -19,6 +19,7 @@ cp "$BIN/Jot" "$APP/Contents/MacOS/Jot"
 cp -R Resources/Fonts "$APP/Contents/Resources/Fonts"
 cp -R Resources/Icons "$APP/Contents/Resources/Icons"      # simple-icons (CC0) + Lucide (ISC) glyphs
 cp -R Resources/Sounds "$APP/Contents/Resources/Sounds"    # Kenney Interface Sounds (CC0)
+cp -R Resources/AdBlock "$APP/Contents/Resources/AdBlock"    # Peter Lowe ad-server list + CN networks
 cp -R Resources/About "$APP/Contents/Resources/About"      # WeChat / reward QR codes
 cp THIRD_PARTY_NOTICES.md "$APP/Contents/Resources/"
 for b in "$BIN"/*.bundle; do if [ -e "$b" ]; then cp -R "$b" "$APP/Contents/Resources/"; fi; done

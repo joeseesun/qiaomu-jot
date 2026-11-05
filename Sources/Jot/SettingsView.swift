@@ -304,10 +304,16 @@ struct RecordSettings: View {
                 Toggle("空选时收录剪贴板", isOn: $prefs.clipboardFallback)
                     .help("按 ⌘⇧K 没有选中内容时，收录剪贴板里刚复制的内容；关掉后跳过剪贴板，仍收录刚截的屏、录屏和当前网页")
             }
+            Section {
+                Toggle("存网页时附上页面描述", isOn: $prefs.pageDescription)
+                    .help("存网页链接时顺带抓取页面描述（og:description）写在链接下方，日后能搜到")
+                Toggle("存网页时自动附上头部截图", isOn: $prefs.pageSnapshot)
+                    .help("后台渲染网页顶部并自动补到该条下方；渲染器没有浏览器登录态，登录墙站点会失败")
+            }
         }
         .formStyle(.grouped)
         .frame(width: settingsWidth,
-               height: 652 + (prefs.timestamp ? 44 : 0) + (prefs.timestamp && customTime ? 120 : 0) + (style == .custom ? 112 : 0))
+               height: 700 + (prefs.timestamp ? 44 : 0) + (prefs.timestamp && customTime ? 120 : 0) + (style == .custom ? 112 : 0))
         .onAppear { customTime = !TimeFormats.presets.contains { $0.format == prefs.timeFormat } }
     }
 

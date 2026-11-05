@@ -46,6 +46,10 @@ final class Prefs: ObservableObject {
     @AppStorage("linkTitles") var linkTitles: Bool = true
     /// ⌘⇧K with nothing selected also saves what was just copied; off = skip the clipboard (screenshot and page link still work).
     @AppStorage("clipboardFallback") var clipboardFallback: Bool = true
+    /// A saved page link also gets the page description under it (og:description, same request as the title).
+    @AppStorage("pageDescription") var pageDescription: Bool = true
+    /// A saved page link gets an offscreen render of the page top tucked under the entry.
+    @AppStorage("pageSnapshot") var pageSnapshot: Bool = true
     /// Daily notes in a plain (non-Obsidian) folder.
     @AppStorage("plainDailyFolder") var plainDailyFolder: String = "日记"
     @AppStorage("plainDailyFormat") var plainDailyFormat: String = "YYYY-MM-DD"

@@ -32,22 +32,30 @@ enum OCR {
 
 /// Fetches a page title so a pasted bare link can become [title](url).
 enum LinkTitle {
-    static func fetch(_ url: URL, completion: @escaping (String?) -> Void) {
-        var req = URLRequest(url: url, timeoutInterval: 6)
+    /// The first 400 KB of a page as text (UTF-8 with a GB18030 fallback), delivered raw so
+    /// each caller parses on the background thread and only the result hops to main.
+    private static func html(_ url: URL, timeout: TimeInterval, completion: @escaping (String?) -> Void) {
+        var req = URLRequest(url: url, timeoutInterval: timeout)
         req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
                      forHTTPHeaderField: "User-Agent")
         URLSession.shared.dataTask(with: req) { data, resp, _ in
-            var title: String?
+            var html: String?
             if let data, let http = resp as? HTTPURLResponse, (200..<400).contains(http.statusCode),
                (http.mimeType ?? "text/html").contains("html") {
                 let head = data.prefix(400_000)
                 let gb = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(
                     CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue)))
-                let html = String(data: head, encoding: .utf8) ?? String(data: head, encoding: gb) ?? ""
-                title = parse(html)
+                html = String(data: head, encoding: .utf8) ?? String(data: head, encoding: gb) ?? ""
             }
-            DispatchQueue.main.async { completion(title) }
+            completion(html)
         }.resume()
+    }
+
+    static func fetch(_ url: URL, completion: @escaping (String?) -> Void) {
+        html(url, timeout: 6) { html in
+            let title = html.flatMap(parse)
+            DispatchQueue.main.async { completion(title) }
+        }
     }
 
     /// og:title first (cleaner on most sites), then <title>.
@@ -86,6 +94,35 @@ enum LinkTitle {
             last = NSMaxRange(m.range)
         }
         return out + ns.substring(from: last)
+    }
+
+    /// The page's own description from one request. `timeout` stays short: the description is
+    /// a nice-to-have, the capture must not wait on slow servers.
+    static func description(_ url: URL, timeout: TimeInterval = 3, completion: @escaping (String?) -> Void) {
+        html(url, timeout: timeout) { html in
+            let text = html.flatMap(parseDescription)
+            DispatchQueue.main.async { completion(text) }
+        }
+    }
+
+    /// og:description first (usually written for humans), then <meta name="description">.
+    static func parseDescription(_ html: String) -> String? {
+        let patterns = [
+            #"<meta[^>]+property=["']og:description["'][^>]*content=["']([^"']+)["']"#,
+            #"<meta[^>]+content=["']([^"']+)["'][^>]*property=["']og:description["']"#,
+            #"<meta[^>]+name=["']description["'][^>]*content=["']([^"']+)["']"#,
+            #"<meta[^>]+content=["']([^"']+)["'][^>]*name=["']description["']"#,
+        ]
+        for p in patterns {
+            guard let re = try? NSRegularExpression(pattern: p, options: [.caseInsensitive]),
+                  let m = re.firstMatch(in: html, range: NSRange(location: 0, length: (html as NSString).length)) else { continue }
+            var t = (html as NSString).substring(with: m.range(at: 1))
+            t = decodeEntities(t).replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+                .trimmingCharacters(in: .whitespaces)
+            if t.count > 160 { t = String(t.prefix(160)) + "…" }
+            if !t.isEmpty { return t }
+        }
+        return nil
     }
 }
 
